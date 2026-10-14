@@ -794,7 +794,7 @@ int analyze_connection(connection_state_t *state, int *bits,
     return *bits == 20 ? 0 : 1;
 }
 
-int crack_strategy0(connection_state_t *state);
+int crack_strategy0(connection_state_t *state, int brute_addr_types);
 int crack_strategy1(connection_state_t *state);
 int crack_strategy2(connection_state_t *state, int verbose);
 
@@ -807,7 +807,7 @@ void decrypt(connection_state_t *state);
  * connection_state_t data structure with decrypted packet data and metadata
  * about how many packets were decrypted.
  */
-void do_crack(crackle_state_t *state, int force_strategy) {
+void do_crack(crackle_state_t *state, int force_strategy, int brute_addr_types) {
     int i;
     connection_state_t *conn;
     int num_connections = state->current_conn + 1;
@@ -859,7 +859,7 @@ void do_crack(crackle_state_t *state, int force_strategy) {
             printf("  Cracking with strategy %d, %d bits of entropy\n",
                     strategy, bits);
             if (strategy == 0) {
-                tk = crack_strategy0(conn);
+                tk = crack_strategy0(conn, brute_addr_types);
             } else {
                 tk = crack_strategy1(conn);
             }
@@ -879,6 +879,17 @@ void do_crack(crackle_state_t *state, int force_strategy) {
             if (tk == 0)
                 printf("  ding ding ding, using a TK of 0! Just Cracks(tm)\n");
             printf("  !!!\n\n");
+
+            // crack_strategy0 may have corrected iat/rat while brute forcing
+            // the address types; report the types that actually reproduced
+            // the confirm (these can differ from the CONNECT_IND summary above).
+            if (conn->connect_found) {
+                printf("  Address types used: ");
+                print_48(conn->ia);
+                printf(" (%s) -> ", conn->iat == 0 ? "public" : "random");
+                print_48(conn->ra);
+                printf(" (%s)\n", conn->rat == 0 ? "public" : "random");
+            }
 
             // see above: strategy 2 decrypts while discovering the TK, but
             // strategies 1 and 2 do not. Thus we need to do the decrypting down
@@ -924,7 +935,7 @@ void do_crack(crackle_state_t *state, int force_strategy) {
  *  -1: crack failed
  *  0 - 999,999: the cracked TK
  */
-int crack_strategy0(connection_state_t *state) {
+int crack_strategy0(connection_state_t *state, int brute_addr_types) {
     int r = -1, tk_found = 0;
     int numeric_key;
     uint8_t confirm_mrand[16] = { 0, };
@@ -932,16 +943,45 @@ int crack_strategy0(connection_state_t *state) {
     // crack TK by comparing the Confirm Pairing retrieved values with the confirm values
     // computed with the confirm value generation function c1 (page 1962, BT 4.0 spec)
 
-    // brute force the TK, starting with 0 for Just Works
-    for (numeric_key = 0; numeric_key <= 999999; numeric_key++) {
-        calc_confirm(state, 1, numeric_key, confirm_mrand);
-        r  = memcmp(state->mconfirm, confirm_mrand, 16) == 0;
-        // just in case the other confirm was master's
-        r |= memcmp(state->sconfirm, confirm_mrand, 16) == 0;
-        if (r) {
-            tk_found = 1;
-            break;
+    // The iat/rat used in c1 are the address *types* of the two peers, taken
+    // from the CONNECT_IND. With brute_addr_types (-a), also try the other
+    // address-type combinations: an initiator can put a type in the
+    // CONNECT_IND that disagrees with the type both sides actually used in the
+    // pairing (e.g. it connects "public" to a device whose identity, and
+    // therefore its SMP address type, is random). They're one bit each, so try
+    // all combinations and keep the one that reproduces the confirm. Without
+    // the flag, only the captured types are used (upstream behaviour).
+    uint8_t iat_orig = state->iat, rat_orig = state->rat;
+    int iat_lo = iat_orig, iat_hi = iat_orig;
+    int rat_lo = rat_orig, rat_hi = rat_orig;
+    if (brute_addr_types) {
+        iat_lo = 0; iat_hi = 1;
+        rat_lo = 0; rat_hi = 1;
+    }
+
+    int iat_try, rat_try;
+    for (iat_try = iat_lo; iat_try <= iat_hi && !tk_found; iat_try++) {
+      for (rat_try = rat_lo; rat_try <= rat_hi && !tk_found; rat_try++) {
+        state->iat = iat_try;
+        state->rat = rat_try;
+        // brute force the TK, starting with 0 for Just Works
+        for (numeric_key = 0; numeric_key <= 999999; numeric_key++) {
+            calc_confirm(state, 1, numeric_key, confirm_mrand);
+            r  = memcmp(state->mconfirm, confirm_mrand, 16) == 0;
+            // just in case the other confirm was master's
+            r |= memcmp(state->sconfirm, confirm_mrand, 16) == 0;
+            if (r) {
+                tk_found = 1;
+                break;
+            }
         }
+      }
+    }
+    // Restore the captured types if nothing matched; otherwise leave the
+    // working types in place (printouts and any later use stay correct).
+    if (!tk_found) {
+        state->iat = iat_orig;
+        state->rat = rat_orig;
     }
 
     return tk_found ? numeric_key : -1;
@@ -1202,6 +1242,9 @@ void usage(void) {
     printf("    Example: -l 81b06facd90fe7a6e9bbd9cee59736a7\n");
     printf("\n");
     printf("Optional arguments:\n");
+    printf("    -a   Also brute force the initiator/responder address types\n");
+    printf("         (handles a CONNECT_IND whose TxAdd/RxAdd disagree with the\n");
+    printf("         types the peers used in c1; ~4x slower, still sub-second)\n");
     printf("    -v   Be verbose\n");
     printf("    -t   Run tests against crypto engine\n");
     printf("\n");
@@ -1224,15 +1267,20 @@ int main(int argc, char **argv) {
     int verbose = 0, do_tests = 0;
     int do_ltk_decrypt = 0;
     int force_strategy = -1;
+    int brute_addr_types = 0;
     char *pcap_file = NULL;
     char *pcap_file_out = NULL;
     char *ltk = NULL;
     uint8_t ltk_bytes[16];
 
-    while ((opt = getopt(argc, argv, "i:o:vts:hl:")) != -1) {
+    while ((opt = getopt(argc, argv, "i:o:vts:hl:a")) != -1) {
         switch (opt) {
             case 'i':
                 pcap_file = strdup(optarg);
+                break;
+
+            case 'a':
+                brute_addr_types = 1;
                 break;
 
             case 'o':
@@ -1362,7 +1410,7 @@ int main(int argc, char **argv) {
     if (do_ltk_decrypt) {
         ltk_decrypt(&state, ltk_bytes);
     } else {
-        do_crack(&state, force_strategy);
+        do_crack(&state, force_strategy, brute_addr_types);
     }
 
     printf("\n");
